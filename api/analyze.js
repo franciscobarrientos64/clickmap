@@ -12,42 +12,42 @@ export default async function handler(req, res) {
 
   const cleanUrl = url.startsWith('http') ? url.trim() : `https://${url.trim()}`;
 
-  const prompt = `Eres un auditor UX experto en arquitectura de información y navegación web.
-Analiza el sitio: ${cleanUrl}
+  const prompt = `Eres un auditor UX especializado en arquitectura de información.
+Analiza el sitio web: ${cleanUrl}
 
-MISIÓN: Mapear TODOS los destinos navegables y su profundidad de clicks desde la homepage.
+TAREA: Mapear todos los destinos navegables y su profundidad de clicks desde la homepage.
 
 PROCESO:
-1. Visita la homepage en ${cleanUrl}
-2. Extrae TODOS los enlaces: nav principal, sub-menús, dropdowns, footer, CTAs, sidebars
-3. Profundidad 1 = accesible directamente desde homepage (un click)
-4. Profundidad 2 = requiere navegar a una página intermedia primero
-5. Profundidad 3+ = requiere múltiples pasos intermedios
-6. Visita 2-3 páginas secundarias clave para descubrir sus sub-páginas
-7. Sé exhaustivo — busca mínimo 15-30 páginas
+1. Visita ${cleanUrl} y extrae TODOS los enlaces internos
+2. Depth 1 = accesible con 1 click desde homepage
+3. Depth 2 = requiere pasar por una página intermedia
+4. Depth 3+ = múltiples pasos
+5. Visita 2-3 páginas secundarias para descubrir sus sub-páginas
+6. Si el sitio no es accesible o no tiene contenido público, igual devuelve el JSON con lo que puedas encontrar
 
-Responde ÚNICAMENTE con JSON válido, sin markdown ni texto adicional:
-{
-  "siteName": "nombre del sitio",
-  "rootUrl": "${cleanUrl}",
-  "totalDestinations": número,
-  "maxDepth": número,
-  "avgDepth": número_decimal,
-  "summary": "Una frase sobre la complejidad de navegación",
-  "uxVerdict": "Diagnóstico UX concreto: ¿eficiente o no? ¿qué problema específico tiene?",
-  "topIssue": "El problema de navegación más crítico (máx 15 palabras)",
-  "destinations": [
-    {
-      "url": "url_completa",
-      "label": "Nombre de la página",
-      "depth": 1,
-      "category": "Main Nav|Sub-menu|Footer|CTA|Sidebar|Otro",
-      "description": "qué contiene (máx 10 palabras)"
+REGLA CRÍTICA: Tu respuesta debe ser EXCLUSIVAMENTE el objeto JSON. Sin texto antes, sin texto después, sin markdown, sin bloques de código, sin explicaciones. Solo el JSON crudo.
+
+{"siteName":"nombre","rootUrl":"${cleanUrl}","totalDestinations":0,"maxDepth":0,"avgDepth":0,"summary":"resumen breve","uxVerdict":"diagnóstico UX concreto","topIssue":"problema principal en máx 15 palabras","destinations":[{"url":"url","label":"nombre","depth":1,"category":"Main Nav","description":"descripción breve"}]}
+
+Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalDestinations:0, maxDepth:0 y explica en uxVerdict por qué no es auditable.`;
+
+  const extractJSON = (text) => {
+    if (!text) return null;
+    // 1. Try direct parse
+    try { return JSON.parse(text.trim()); } catch {}
+    // 2. Strip markdown fences
+    const stripped = text.replace(/```(?:json)?\n?/gi, '').replace(/```/g, '').trim();
+    try { return JSON.parse(stripped); } catch {}
+    // 3. Greedy match first {...}
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) try { return JSON.parse(match[0]); } catch {}
+    // 4. Find last complete JSON object
+    const matches = [...text.matchAll(/\{[\s\S]*?\}/g)];
+    for (const m of matches.reverse()) {
+      try { const p = JSON.parse(m[0]); if (p.siteName || p.destinations) return p; } catch {}
     }
-  ]
-}
-
-Ordena destinations por depth ascendente.`;
+    return null;
+  };
 
   try {
     const messages = [{ role: 'user', content: prompt }];
@@ -79,22 +79,34 @@ Ordena destinations por depth ascendente.`;
       if (textBlocks.length) finalText = textBlocks.map(b => b.text).join('');
 
       if (data.stop_reason === 'end_turn') break;
-
       if (data.stop_reason === 'tool_use') {
         messages.push({ role: 'assistant', content: data.content });
-        // server-side tool — continue without explicit tool_result
         continue;
       }
       break;
     }
 
-    const match = finalText.match(/\{[\s\S]*\}/);
-    if (!match) return res.status(422).json({ error: 'No se pudo estructurar el análisis. Intenta con otra URL.' });
+    const result = extractJSON(finalText);
 
-    const result = JSON.parse(match[0]);
+    if (!result) {
+      // Last resort: return a structured error response as valid JSON
+      return res.status(200).json({
+        siteName: new URL(cleanUrl).hostname,
+        rootUrl: cleanUrl,
+        totalDestinations: 0,
+        maxDepth: 0,
+        avgDepth: 0,
+        summary: 'No se pudo completar el análisis.',
+        uxVerdict: 'El sitio no pudo ser auditado. Puede estar inactivo, bloqueado por robots.txt, requerir login, o no tener presencia pública indexable.',
+        topIssue: 'Sitio no accesible o no indexado públicamente',
+        destinations: [],
+      });
+    }
+
     if (!result.avgDepth && result.destinations?.length) {
       result.avgDepth = +(result.destinations.reduce((s, d) => s + d.depth, 0) / result.destinations.length).toFixed(1);
     }
+
     return res.status(200).json(result);
   } catch (e) {
     return res.status(500).json({ error: e.message || 'Error al analizar el sitio' });

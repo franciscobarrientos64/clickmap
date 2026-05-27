@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 
-const VERSION = "v1.1.0";
+const VERSION = "v1.1.1";
 
 // ── Depth config ───────────────────────────────────────────────────────────
 const DEPTH_CONFIG = {
