@@ -7,45 +7,27 @@ export default async function handler(req, res) {
 
   const { url } = req.body;
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada en Vercel' });
+  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada' });
   if (!url) return res.status(400).json({ error: 'URL requerida' });
 
   const cleanUrl = url.startsWith('http') ? url.trim() : `https://${url.trim()}`;
+  const host = new URL(cleanUrl).hostname;
 
-  const prompt = `Eres un auditor UX especializado en arquitectura de información.
-Analiza el sitio web: ${cleanUrl}
+  // Prompt compact — keeps input tokens low
+  const prompt = `Visit ${cleanUrl} and map all navigable pages by click depth from homepage.
+Depth 1=direct from homepage, Depth 2=one intermediate page, Depth 3+=deeper.
+Check main nav, footer, CTAs, dropdowns, sidebar links. Visit 2-3 secondary pages.
 
-TAREA: Mapear todos los destinos navegables y su profundidad de clicks desde la homepage.
-
-PROCESO:
-1. Visita ${cleanUrl} y extrae TODOS los enlaces internos
-2. Depth 1 = accesible con 1 click desde homepage
-3. Depth 2 = requiere pasar por una página intermedia
-4. Depth 3+ = múltiples pasos
-5. Visita 2-3 páginas secundarias para descubrir sus sub-páginas
-6. Si el sitio no es accesible o no tiene contenido público, igual devuelve el JSON con lo que puedas encontrar
-
-REGLA CRÍTICA: Tu respuesta debe ser EXCLUSIVAMENTE el objeto JSON. Sin texto antes, sin texto después, sin markdown, sin bloques de código, sin explicaciones. Solo el JSON crudo.
-
-{"siteName":"nombre","rootUrl":"${cleanUrl}","totalDestinations":0,"maxDepth":0,"avgDepth":0,"summary":"resumen breve","uxVerdict":"diagnóstico UX concreto","topIssue":"problema principal en máx 15 palabras","destinations":[{"url":"url","label":"nombre","depth":1,"category":"Main Nav","description":"descripción breve"}]}
-
-Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalDestinations:0, maxDepth:0 y explica en uxVerdict por qué no es auditable.`;
+Respond ONLY with raw JSON (no markdown, no text):
+{"siteName":"","rootUrl":"${cleanUrl}","totalDestinations":0,"maxDepth":0,"avgDepth":0,"summary":"","uxVerdict":"","topIssue":"","destinations":[{"url":"","label":"","depth":1,"category":"Main Nav","description":""}]}`;
 
   const extractJSON = (text) => {
     if (!text) return null;
-    // 1. Try direct parse
     try { return JSON.parse(text.trim()); } catch {}
-    // 2. Strip markdown fences
-    const stripped = text.replace(/```(?:json)?\n?/gi, '').replace(/```/g, '').trim();
-    try { return JSON.parse(stripped); } catch {}
-    // 3. Greedy match first {...}
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) try { return JSON.parse(match[0]); } catch {}
-    // 4. Find last complete JSON object
-    const matches = [...text.matchAll(/\{[\s\S]*?\}/g)];
-    for (const m of matches.reverse()) {
-      try { const p = JSON.parse(m[0]); if (p.siteName || p.destinations) return p; } catch {}
-    }
+    const clean = text.replace(/```(?:json)?\n?/gi, '').replace(/```/g, '').trim();
+    try { return JSON.parse(clean); } catch {}
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) try { return JSON.parse(m[0]); } catch {}
     return null;
   };
 
@@ -53,7 +35,7 @@ Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalD
     const messages = [{ role: 'user', content: prompt }];
     let finalText = '';
 
-    for (let round = 0; round < 8; round++) {
+    for (let round = 0; round < 5; round++) {
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -62,8 +44,8 @@ Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalD
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 4000,
+          model: 'claude-haiku-4-5-20251001', // faster + lower token cost
+          max_tokens: 2000,
           tools: [{ type: 'web_search_20250305', name: 'web_search' }],
           messages,
         }),
@@ -71,7 +53,7 @@ Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalD
 
       if (!resp.ok) {
         const e = await resp.json().catch(() => ({}));
-        throw new Error(e?.error?.message || `Anthropic API error ${resp.status}`);
+        throw new Error(e?.error?.message || `API error ${resp.status}`);
       }
 
       const data = await resp.json();
@@ -80,7 +62,9 @@ Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalD
 
       if (data.stop_reason === 'end_turn') break;
       if (data.stop_reason === 'tool_use') {
+        // Only keep last 2 turns to avoid token accumulation
         messages.push({ role: 'assistant', content: data.content });
+        if (messages.length > 4) messages.splice(1, messages.length - 4);
         continue;
       }
       break;
@@ -89,15 +73,14 @@ Rellena ese esquema con datos reales del sitio. Si no puedes acceder, pon totalD
     const result = extractJSON(finalText);
 
     if (!result) {
-      // Last resort: return a structured error response as valid JSON
       return res.status(200).json({
-        siteName: new URL(cleanUrl).hostname,
+        siteName: host,
         rootUrl: cleanUrl,
         totalDestinations: 0,
         maxDepth: 0,
         avgDepth: 0,
-        summary: 'No se pudo completar el análisis.',
-        uxVerdict: 'El sitio no pudo ser auditado. Puede estar inactivo, bloqueado por robots.txt, requerir login, o no tener presencia pública indexable.',
+        summary: 'Sitio no auditable.',
+        uxVerdict: 'No fue posible acceder al contenido público del sitio. Puede estar inactivo, bloqueado por robots.txt o requerir autenticación.',
         topIssue: 'Sitio no accesible o no indexado públicamente',
         destinations: [],
       });
